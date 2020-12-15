@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 )
 
 const (
@@ -22,8 +23,11 @@ const (
 )
 
 type ReqBody struct {
-	Query     string                 `json:"query"`
-	Variables map[string]interface{} `json:"variables"`
+	//Query string `json:"query"`
+	//Variables map[string]interface{} `json:"variables"`
+	Offset  *int   `json:"offset"`
+	Limit   *int   `json:"limit"`
+	Keyword string `json:"keyword"`
 }
 
 type Result struct {
@@ -96,6 +100,11 @@ func (m MasterData) GetQuery(key string) []interface{} {
 			ret = append(ret, img)
 		}
 		return ret
+	case InstanceSearch:
+		for _, img := range m.Instances {
+			ret = append(ret, img)
+		}
+		return ret
 	}
 	return nil
 }
@@ -155,10 +164,10 @@ func LoadMasterData() {
 	}
 }
 
-func ParseVariables(variables map[string]interface{}, offsetR, limitR string) (int, int, bool) {
+func ParseVariables(reqBody ReqBody, offsetR, limitR string) (int, int, string) {
 	limit := 10
-	offset := 0
-	isSearch := false
+	offset := 1
+	searchKeyword := ""
 	var er error
 	if limitR != "" {
 		limit, er = strconv.Atoi(limitR)
@@ -172,20 +181,17 @@ func ParseVariables(variables map[string]interface{}, offsetR, limitR string) (i
 		limit = 10
 		offset = 0
 	}
-	if l, ok := variables["limit"]; ok {
-		limit = l.(int)
+	if reqBody.Limit != nil {
+		limit = *reqBody.Limit
 	}
-	if o, ok := variables["offset"]; ok {
-		offset = o.(int)
+	if reqBody.Offset != nil {
+		offset = *reqBody.Offset
 	}
-
-	if _, ok := variables["search"]; ok {
-		isSearch = true
-	}
-	return limit, offset, isSearch
+	searchKeyword = reqBody.Keyword
+	return limit, offset, searchKeyword
 }
 
-func CreateResult(limit int, offset int, data []interface{}, isSearch bool, query string) Result {
+func CreateResult(limit int, offset int, data []interface{}, searchKeyword string, query string) Result {
 	result := Result{}
 	totalCount := len(data)
 	trueLimit := limit
@@ -196,7 +202,7 @@ func CreateResult(limit int, offset int, data []interface{}, isSearch bool, quer
 		}
 		return result
 	}
-	if offset >= len(data) {
+	if offset > len(data) {
 		result.Error = map[string]interface{}{
 			"message": fmt.Sprint("Offset cannot be greater than length of data i.e., ", totalCount),
 			"code":    402,
@@ -209,9 +215,9 @@ func CreateResult(limit int, offset int, data []interface{}, isSearch bool, quer
 
 	resultData := []interface{}{}
 
-	fmt.Println("offset: ", offset)
-	fmt.Println("trueLimit: ", trueLimit)
-	fmt.Println("offset+trueLimit: ", offset+trueLimit)
+	//fmt.Println("offset: ", offset)
+	//fmt.Println("trueLimit: ", trueLimit)
+	//fmt.Println("offset+trueLimit: ", offset+trueLimit)
 	for i := offset - 1; i < offset+trueLimit-1; i++ {
 		resultData = append(resultData, data[i])
 	}
@@ -221,14 +227,31 @@ func CreateResult(limit int, offset int, data []interface{}, isSearch bool, quer
 		"limit":      strconv.Itoa(limit),
 		"kind":       query,
 	}
+	if searchKeyword != "" {
+		m := result.Metadata.(map[string]string)
+		m["keyword"] = searchKeyword
+		result.Metadata = m
+	}
 	result.Data = resultData
 	return result
 }
 
-func ExecuteQuery(ctx context.Context, query string, variables map[string]interface{}, offsetR, limitR string) Result {
-	fmt.Println(query)
-	limit, offset, _ := ParseVariables(variables, offsetR, limitR)
-	return CreateResult(limit, offset, masterData.GetQuery(query), false, query)
+func ExecuteQuery(ctx context.Context, query string, reqBody ReqBody, offsetR, limitR string) Result {
+	//fmt.Println(query)
+	limit, offset, searchKeyword := ParseVariables(reqBody, offsetR, limitR)
+	if query == InstanceSearch && searchKeyword != "" {
+		//TODO: Take some sophisticated approach and remove this hack
+		instances := masterData.Instances
+		res := []interface{}{}
+		for _, inst := range instances {
+			if strings.Contains(inst.Name, searchKeyword) {
+				res = append(res, inst)
+			}
+		}
+		return CreateResult(limit, offset, res, searchKeyword, query)
+
+	}
+	return CreateResult(limit, offset, masterData.GetQuery(query), "", query)
 	//switch query {
 	//case Regions:
 	//return CreateResult(limit, offset, masterData.GetQuery(query), false, Regions)
@@ -258,9 +281,9 @@ func JsonMiddleware(resourceType string) http.HandlerFunc {
 		}
 		offset := r.URL.Query().Get("offset")
 		limit := r.URL.Query().Get("limit")
-		fmt.Println("QueryParams")
-		fmt.Println(limit)
-		fmt.Println(offset)
+		//fmt.Println("QueryParams")
+		//fmt.Println(limit)
+		//fmt.Println(offset)
 		var rBody ReqBody
 		err := json.NewDecoder(r.Body).Decode(&rBody)
 		if err != nil {
@@ -270,7 +293,14 @@ func JsonMiddleware(resourceType string) http.HandlerFunc {
 			fmt.Println(r.Body)
 		}
 		statusCode := 200
-		result := ExecuteQuery(r.Context(), resourceType, rBody.Variables, offset, limit)
+		fmt.Print("Route: ")
+		fmt.Println(resourceType)
+		fmt.Println("offset: ", offset)
+		fmt.Println("length: ", limit)
+		fmt.Println("Request Body: ")
+		b1, _ := json.Marshal(rBody)
+		fmt.Println(string(b1))
+		result := ExecuteQuery(r.Context(), resourceType, rBody, offset, limit)
 		if result.Error != nil {
 			fmt.Printf("Failed to process the request due to:\n %+v\n", result.Error)
 			statusCode = 500
@@ -297,8 +327,9 @@ func main() {
 	http.HandleFunc(fmt.Sprint(BaseURI, InstanceTypes), JsonMiddleware(InstanceTypes))
 	http.HandleFunc(fmt.Sprint(BaseURI, Regions), JsonMiddleware(Regions))
 	http.HandleFunc(fmt.Sprint(BaseURI, Instances), JsonMiddleware(Instances))
+
+	http.HandleFunc(fmt.Sprint(BaseURI, InstanceSearch), JsonMiddleware(InstanceSearch))
 	http.ListenAndServe(fmt.Sprint(":", port), nil)
 
 	fmt.Println("Server is serving on port ", port)
-
 }
